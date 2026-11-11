@@ -1,6 +1,7 @@
 # Telenot Bridge
 
-![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/traktuner/telenot-bridge)](https://github.com/traktuner/telenot-bridge/releases)
 [![CI](https://github.com/traktuner/telenot-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/traktuner/telenot-bridge/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/traktuner/telenot-bridge/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/traktuner/telenot-bridge/actions/workflows/codeql-analysis.yml)
 [![Docker image](https://github.com/traktuner/telenot-bridge/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/traktuner/telenot-bridge/actions/workflows/docker-publish.yml)
@@ -156,8 +157,9 @@ installation into the repository.
 
 ## License
 
-The file [LICENSE](LICENSE) contains the license text (Apache License 2.0).
-Note: `package.json` names the ISC license. The two statements do not agree yet.
+This project is licensed under the [Apache License 2.0](LICENSE). The original author changed the
+license from ISC to Apache 2.0 in the commit "fix(license): correct license type from ISC to Apache 2.0".
+The changes of this fork (see [About this fork](#about-this-fork)) are under the same license.
 
 ## Acknowledgements
 
