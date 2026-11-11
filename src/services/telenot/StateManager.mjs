@@ -1,5 +1,8 @@
 import config from '../../config/config.mjs'
 
+/** Alarm roles that a configured position can carry, in order of priority. */
+const ALARM_ROLES = ['triggered', 'armed_away', 'armed_home']
+
 /**
  * Handles Telenot sensor states and their changes.
  */
@@ -8,10 +11,14 @@ class StateManager {
      * Constructs a new StateManager instance.
      * @param {Object} logger - The logger object for logging messages.
      * @param {Object} mqttHandler - The MQTT handler for publishing messages.
+     * @param {Object} [virtualStateHandler] - Maps 'armed_home' to a virtual mode such as 'armed_night'.
      */
-    constructor(logger, mqttHandler) {
+    constructor(logger, mqttHandler, virtualStateHandler = null) {
         this.logger = logger
         this.mqttHandler = mqttHandler
+        this.virtualStateHandler = virtualStateHandler
+        this.lastAlarmState = null
+        this.pendingArm = false
         this.statesPrevious = new Map()
         this.lastPublishedStates = new Map()
         this.initialStatePublished = false
@@ -59,6 +66,16 @@ class StateManager {
 
         for (const [byteIndex, byteValue] of byteMap) {
             if (prevMap.get(byteIndex) !== byteValue) {
+                if (this.config.Discover) {
+                    this.logAllBitChanges(
+                        byteValue,
+                        prevMap.get(byteIndex) || 0,
+                        byteIndex,
+                        contentName,
+                        contentConfig.positions,
+                    )
+                }
+
                 await this.processStateChanges(
                     byteValue,
                     prevMap.get(byteIndex) || 0,
@@ -103,6 +120,37 @@ class StateManager {
                     contentName,
                 )
             }
+        }
+    }
+
+    /**
+     * Logs every changed bit of one byte, also bits without a configured position.
+     * Use it to find the real positions of a panel: change one state on the
+     * panel and read the 'DISCOVERY:' line.
+     * @param {number} newValue - The new byte value.
+     * @param {number} oldValue - The previous byte value.
+     * @param {number} byteIndex - The index of the byte.
+     * @param {string} contentName - The name of the content area.
+     * @param {Array<Object>} positions - The configured positions of the content area.
+     */
+    logAllBitChanges(newValue, oldValue, byteIndex, contentName, positions) {
+        const newBinary = StateManager.reverseBinary(newValue)
+        const oldBinary = StateManager.reverseBinary(oldValue)
+
+        for (let bitIndex = 0; bitIndex < 8; bitIndex++) {
+            if (newBinary[bitIndex] === oldBinary[bitIndex]) {
+                continue
+            }
+
+            const position = byteIndex * 8 + bitIndex
+            const hex = `0x${position.toString(16).toUpperCase().padStart(3, '0')}`
+            const configured = positions.find((pos) => parseInt(pos.hex, 16) === position)
+
+            this.logger.info(
+                `DISCOVERY: ${new Date().toISOString()} | ${contentName} | ${hex} (dec:${position}) | ` +
+                    `Byte:${byteIndex} Bit:${bitIndex} | ${oldBinary[bitIndex]}->${newBinary[bitIndex]} | ` +
+                    `${configured ? configured.name : 'UNKNOWN'}`,
+            )
         }
     }
 
@@ -158,6 +206,10 @@ class StateManager {
                 )
 
                 this.lastPublishedStates.set(position.topic, state)
+
+                if (this.isAlarmStatePosition(position)) {
+                    await this.publishAlarmStateIfChanged()
+                }
             } catch (error) {
                 this.logger.error(`\x1b[31mFailed to publish ${position.topic}:\x1b[0m ${error}`)
             }
@@ -208,6 +260,26 @@ class StateManager {
     }
 
     /**
+     * Publishes all known states again, for example after an MQTT reconnect.
+     * A state that changed while the broker was unreachable is otherwise lost
+     * until the same bit changes again.
+     */
+    async republishAll() {
+        this.logger.info('Publishing all known states again')
+        this.lastPublishedStates.clear()
+        this.lastAlarmState = null
+
+        for (const [contentName, byteMap] of this.statesPrevious) {
+            const contentConfig = this.config.Telenot?.[contentName]
+            if (contentConfig?.positions) {
+                await this.publishPositionStates(byteMap, contentConfig.positions, contentName)
+            }
+        }
+
+        await this.publishAlarmState()
+    }
+
+    /**
      * Publishes the current alarm state to the MQTT state topic.
      * @fires StateManager#log
      */
@@ -219,20 +291,96 @@ class StateManager {
         await this.mqttHandler.publish(stateTopic, currentState, {
             retain: true,
         })
+        this.lastAlarmState = currentState
+    }
+
+    /**
+     * Publishes the alarm state only if it differs from the last published one.
+     */
+    async publishAlarmStateIfChanged() {
+        if (this.determineAlarmState() !== this.lastAlarmState) {
+            await this.publishAlarmState()
+        }
+    }
+
+    /**
+     * Returns all configured positions of all content areas.
+     * @returns {Array<Object>} The positions.
+     */
+    getAllPositions() {
+        return Object.values(this.config.Telenot || {})
+            .filter((content) => content && Array.isArray(content.positions))
+            .flatMap((content) => content.positions)
+    }
+
+    /**
+     * Returns the topics of the positions that carry the given alarm role.
+     * A position gets a role with `role: 'armed_away' | 'armed_home' | 'triggered'`.
+     * Without any configured role the legacy topic names are used:
+     * a topic that ends with '/extern_scharf' or '/intern_scharf'.
+     * @param {string} role - The alarm role.
+     * @returns {Array<string>} The topics.
+     */
+    getTopicsForRole(role) {
+        const positions = this.getAllPositions()
+        const withRole = positions.filter((pos) => pos.role)
+
+        if (withRole.length > 0) {
+            return withRole.filter((pos) => pos.role === role).map((pos) => pos.topic)
+        }
+
+        const legacySuffix = { armed_away: '/extern_scharf', armed_home: '/intern_scharf' }[role]
+        if (!legacySuffix) {
+            return []
+        }
+        return positions
+            .filter((pos) => typeof pos.topic === 'string' && pos.topic.endsWith(legacySuffix))
+            .map((pos) => pos.topic)
+    }
+
+    /**
+     * Tells whether a position takes part in the alarm state.
+     * @param {Object} position - The position object from config.
+     * @returns {boolean} True if a change of this position can change the alarm state.
+     */
+    isAlarmStatePosition(position) {
+        return ALARM_ROLES.some((role) => this.getTopicsForRole(role).includes(position.topic))
     }
 
     /**
      * Determines the current alarm state from the last published states.
-     * @returns {string} Either 'DISARMED', 'ARMED_HOME', or 'ARMED_AWAY'.
+     * The values are the Home Assistant MQTT alarm panel states.
+     * @returns {string} 'triggered', 'armed_away', 'armed_home' (or its virtual mode), 'arming' or 'disarmed'.
      */
     determineAlarmState() {
-        if (this.lastPublishedStates.get('telenot/alarm/kg/ema_zentrale/extern_scharf') === 'ON') {
-            return 'ARMED_AWAY'
+        const isOn = (role) =>
+            this.getTopicsForRole(role).some(
+                (topic) => this.lastPublishedStates.get(topic) === 'ON',
+            )
+
+        if (isOn('triggered')) {
+            return 'triggered'
         }
-        if (this.lastPublishedStates.get('telenot/alarm/kg/ema_zentrale/intern_scharf') === 'ON') {
-            return 'ARMED_HOME'
+        if (isOn('armed_away')) {
+            return 'armed_away'
         }
-        return 'DISARMED'
+        if (isOn('armed_home')) {
+            return this.virtualStateHandler
+                ? this.virtualStateHandler.mapToExternalState('armed_home')
+                : 'armed_home'
+        }
+        // A command to arm waits for its exit delay.
+        return this.pendingArm ? 'arming' : 'disarmed'
+    }
+
+    /**
+     * Marks that an arm command waits for its exit delay and publishes the state.
+     * @param {boolean} pending - True while the delay runs.
+     * @returns {Promise<void>}
+     */
+    async setPendingArm(pending) {
+        this.pendingArm = Boolean(pending)
+        await this.publishAlarmStateIfChanged()
     }
 }
 

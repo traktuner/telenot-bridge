@@ -59,8 +59,8 @@ describe('SocketManager', () => {
             expect(socketManager.socket).toBeNull()
             expect(socketManager.isConnected).toBe(false)
             expect(socketManager.reconnectAttempts).toBe(0)
-            expect(socketManager.maxReconnectAttempts).toBe(5)
             expect(socketManager.reconnectInterval).toBe(5000)
+            expect(socketManager.maxReconnectInterval).toBe(60000)
         })
     })
 
@@ -99,7 +99,11 @@ describe('SocketManager', () => {
             expect(socketManager.reconnectAttempts).toBe(0)
 
             // Verify event listeners are set up
-            expect(mockSocket.on).toHaveBeenCalledWith('data', onData)
+            expect(mockSocket.on).toHaveBeenCalledWith('data', expect.any(Function))
+            const dataCallback = mockSocket.on.mock.calls.find((call) => call[0] === 'data')[1]
+            const frame = Buffer.from('6802026840024216', 'hex')
+            dataCallback(frame)
+            expect(onData).toHaveBeenCalledWith(frame)
             expect(mockSocket.on).toHaveBeenCalledWith('error', expect.any(Function))
             expect(mockSocket.on).toHaveBeenCalledWith('close', expect.any(Function))
             expect(mockSocket.on).toHaveBeenCalledWith('timeout', expect.any(Function))
@@ -154,7 +158,7 @@ describe('SocketManager', () => {
                 'Socket connection timed out. Ending connection...',
             )
             expect(socketManager.isConnected).toBe(false)
-            expect(mockSocket.end).toHaveBeenCalled()
+            expect(mockSocket.destroy).toHaveBeenCalled()
             expect(handleReconnectSpy).toHaveBeenCalled()
         })
     })
@@ -171,51 +175,87 @@ describe('SocketManager', () => {
             jest.useRealTimers()
         })
 
-        it('should clear existing reconnect timeout before setting a new one', () => {
-            jest.spyOn(global, 'clearTimeout')
-
-            // Simulate that reconnectTimeout is already set
-            socketManager.reconnectTimeout = setTimeout(() => {}, 1000)
-
-            // Capture the existing timeout handle before calling handleReconnect()
-            const existingTimeout = socketManager.reconnectTimeout
-
+        it('should schedule only one attempt when several socket events follow one failure', () => {
+            socketManager.handleReconnect()
+            const firstTimeout = socketManager.reconnectTimeout
+            socketManager.handleReconnect()
             socketManager.handleReconnect()
 
-            // Verify that clearTimeout was called with the previous timeout handle
-            expect(clearTimeout).toHaveBeenCalledWith(existingTimeout)
+            expect(socketManager.reconnectTimeout).toBe(firstTimeout)
+            expect(socketManager.reconnectAttempts).toBe(1)
 
-            // Verify that a new reconnectTimeout has been set
-            expect(socketManager.reconnectTimeout).not.toBe(existingTimeout)
-            expect(socketManager.reconnectTimeout).toBeDefined()
-
-            // Fast-forward time to trigger reconnection
             jest.advanceTimersByTime(socketManager.reconnectInterval)
-            expect(socketManager.createConnection).toHaveBeenCalled()
+            expect(socketManager.createConnection).toHaveBeenCalledTimes(1)
+            expect(socketManager.reconnectTimeout).toBeNull()
         })
 
-        it('should attempt to reconnect if below max attempts', () => {
-            socketManager.reconnectAttempts = 2
-            socketManager.handleReconnect()
-
-            // Verify reconnection attempt count and logging
-            expect(socketManager.reconnectAttempts).toBe(3)
-            expect(mockLogger.info).toHaveBeenCalledWith(`Attempting to reconnect (3/5)...`)
-
-            // Fast-forward time to trigger reconnection
-            jest.advanceTimersByTime(socketManager.reconnectInterval)
-            expect(socketManager.createConnection).toHaveBeenCalled()
+        it('should never stop its reconnect attempts', () => {
+            for (let attempt = 1; attempt <= 50; attempt++) {
+                socketManager.handleReconnect()
+                jest.advanceTimersByTime(socketManager.maxReconnectInterval)
+                expect(socketManager.createConnection).toHaveBeenCalledTimes(attempt)
+            }
+            expect(mockLogger.error).not.toHaveBeenCalled()
         })
 
-        it('should log an error if max attempts are reached', () => {
-            socketManager.reconnectAttempts = socketManager.maxReconnectAttempts // Max attempts reached
+        it('should increase the delay up to the limit', () => {
+            const delays = []
+            for (let attempt = 1; attempt <= 6; attempt++) {
+                socketManager.reconnectAttempts = attempt
+                delays.push(socketManager.getReconnectDelay())
+            }
+            expect(delays).toEqual([5000, 10000, 20000, 40000, 60000, 60000])
+        })
 
+        it('should not reconnect after closeConnection', () => {
+            socketManager.closeConnection()
             socketManager.handleReconnect()
 
-            // Verify error logging
-            expect(mockLogger.error).toHaveBeenCalledWith(
-                'Max reconnection attempts reached. Please check the connection manually.',
-            )
+            expect(socketManager.reconnectTimeout).toBeNull()
+            jest.advanceTimersByTime(socketManager.maxReconnectInterval)
+            expect(socketManager.createConnection).not.toHaveBeenCalled()
+        })
+    })
+
+    describe('Reconnect keeps the data handlers', () => {
+        it('should deliver data of the new connection to the original handler', () => {
+            const sockets = []
+            net.Socket.mockImplementation(() => {
+                const socket = {
+                    connect: jest.fn(),
+                    on: jest.fn(),
+                    write: jest.fn(),
+                    setTimeout: jest.fn(),
+                    end: jest.fn(),
+                    destroy: jest.fn(),
+                    destroyed: false,
+                }
+                sockets.push(socket)
+                return socket
+            })
+
+            socketManager.createConnection(onData, onError, onClose)
+            const callbackOf = (socket, event) =>
+                socket.on.mock.calls.find((call) => call[0] === event)[1]
+
+            // The connection fails: 'error' and 'close' follow each other.
+            callbackOf(sockets[0], 'error')(new Error('ECONNRESET'))
+            callbackOf(sockets[0], 'close')()
+            expect(onError).toHaveBeenCalledTimes(1)
+            expect(onClose).toHaveBeenCalledTimes(1)
+
+            jest.advanceTimersByTime(socketManager.reconnectInterval)
+            expect(sockets).toHaveLength(2)
+            expect(sockets[0].destroy).toHaveBeenCalled()
+
+            const frame = Buffer.from('6802026840024216', 'hex')
+            callbackOf(sockets[1], 'data')(frame)
+            expect(onData).toHaveBeenCalledWith(frame)
+
+            // A late event of the replaced socket must not start another reconnect.
+            callbackOf(sockets[0], 'close')()
+            expect(socketManager.reconnectTimeout).toBeNull()
+            expect(onClose).toHaveBeenCalledTimes(1)
         })
     })
 

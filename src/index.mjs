@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 import config from './config/config.mjs'
 
-dotenv.config({ path: join(dirname(fileURLToPath(import.meta.url)), '.env') })
+dotenv.config({ path: join(dirname(fileURLToPath(import.meta.url)), '.env'), quiet: true })
 
 let logger
 
@@ -35,6 +35,14 @@ async function setupHomeAssistant() {
 
         await discovery.publishDiscoveryMessages(sensors)
         logger.info(`Published discovery for ${sensors.length} sensors`)
+
+        const panel = config.Telenot.ALARM_PANEL
+        if (panel?.discovery) {
+            await discovery.publishAlarmPanel(panel)
+            if (panel.reset_button !== false) {
+                await discovery.publishResetButton(panel)
+            }
+        }
     } finally {
         await mqtt.close()
     }
@@ -50,7 +58,7 @@ async function setupHomeAssistant() {
  * @throws {Error} if initialization of any component fails.
  */
 async function startApp() {
-    logger = await initLogger()
+    logger = await initLogger({ LogLevel: config.LogLevel })
 
     try {
         if (config.homeassistant_autodiscovery) {
@@ -68,6 +76,19 @@ async function startApp() {
         // Shutdown handling
         const shutdown = async () => {
             logger.info('Shutting down...')
+            try {
+                // A clean disconnect sends no last will. Tell Home Assistant that the bridge stops.
+                await mqtt.publish(
+                    `${config.Connection.mqttConfig.publishTopic}/status`,
+                    'offline',
+                    {
+                        retain: true,
+                        qos: 1,
+                    },
+                )
+            } catch (error) {
+                logger.warn(`Cannot publish the offline status: ${error?.message || error}`)
+            }
             await mqtt.close()
             process.exit(0)
         }
@@ -78,10 +99,21 @@ async function startApp() {
         // Keep alive
         await new Promise(() => {})
     } catch (error) {
-        logger.error('Startup failed:', error)
+        logger.error(`Startup failed: ${error?.stack || error}`)
         process.exit(1)
     }
 }
+
+// Fail fast: a restart by the container runtime is safer than a process in an unknown state.
+process.on('unhandledRejection', (reason) => {
+    const message = `Unhandled rejection: ${reason?.stack || reason}`
+    if (logger) {
+        logger.error(message)
+    } else {
+        console.error(message)
+    }
+    process.exit(1)
+})
 
 startApp().catch((error) => {
     console.error('Failed to start:', error)

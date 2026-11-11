@@ -513,3 +513,33 @@ describe('SocketHandler', () => {
         })
     })
 })
+
+describe('SocketHandler area address', () => {
+    const logger = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() }
+    let handler, previous
+
+    beforeEach(() => {
+        previous = config.Telenot.AREA_STATE_ADDRESS
+        handler = new SocketHandler(logger, {}, {}, { mapToExternalState: (state) => state })
+    })
+
+    afterEach(() => {
+        config.Telenot.AREA_STATE_ADDRESS = previous
+    })
+
+    it('should match the complex 400H event frames by default', () => {
+        expect(handler.getMsgType('682c2c68730205020005310162')).toBe(5)
+        expect(handler.getMsgType('682c2c68730205020005320161')).toBe(6)
+        expect(handler.getMsgType('682C2C687302050200053001E1')).toBe(7)
+    })
+
+    it('should match the event frames at a configured area address only', () => {
+        config.Telenot.AREA_STATE_ADDRESS = 0x500
+
+        expect(handler.getMsgType('682c2c68730205020005010162')).toBe(5)
+        expect(handler.getMsgType('682c2c68730205020005020161')).toBe(6)
+        expect(handler.getMsgType('682c2c687302050200050001e1')).toBe(7)
+        // The complex 400H address is no state event for this panel.
+        expect(handler.getMsgType('682c2c68730205020005310162')).not.toBe(5)
+    })
+})

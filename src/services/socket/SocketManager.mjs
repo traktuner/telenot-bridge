@@ -1,4 +1,5 @@
 import net from 'net'
+import Heartbeat from '../../utils/Heartbeat.mjs'
 
 /**
  * Manages socket connections for communication with a TCP converter.
@@ -20,9 +21,12 @@ class SocketManager {
         this.socket = null
         this.isConnected = false
         this.reconnectAttempts = 0
-        this.maxReconnectAttempts = 5
-        this.reconnectInterval = 5000 // 5 seconds
+        this.reconnectInterval = 5000 // first retry delay: 5 seconds
+        this.maxReconnectInterval = 60000 // retry delay limit: 60 seconds
         this.reconnectTimeout = null // Store the timeout handle for reconnection
+        this.handlers = { onData: () => {}, onError: () => {}, onClose: () => {} }
+        this.closedByUser = false
+        this.heartbeat = new Heartbeat(logger)
     }
 
     /**
@@ -32,7 +36,18 @@ class SocketManager {
      * @param {function} onClose - Callback function for close events.
      * @returns {net.Socket} The created socket.
      */
-    createConnection(onData = () => {}, onError = () => {}, onClose = () => {}) {
+    createConnection(onData, onError, onClose) {
+        // Keep the handlers. A reconnect must use the same handlers, or the
+        // new connection receives data that nobody processes.
+        if (onData || onError || onClose) {
+            this.handlers = {
+                onData: onData || (() => {}),
+                onError: onError || (() => {}),
+                onClose: onClose || (() => {}),
+            }
+        }
+        this.closedByUser = false
+
         const socket = new net.Socket()
         const { port, host } = this.config.Connection.telnetConfig
 
@@ -42,23 +57,35 @@ class SocketManager {
             this.reconnectAttempts = 0
         })
 
-        socket.on('data', onData)
+        socket.on('data', (data) => {
+            this.heartbeat.beat()
+            this.handlers.onData(data)
+        })
         socket.on('error', (error) => {
+            if (socket !== this.socket) {
+                return
+            }
             this.isConnected = false
-            onError(error)
+            this.handlers.onError(error)
             this.handleReconnect()
         })
         socket.on('close', () => {
+            if (socket !== this.socket) {
+                return
+            }
             this.isConnected = false
-            onClose()
+            this.handlers.onClose()
             this.handleReconnect()
         })
 
         socket.setTimeout(15000)
         socket.on('timeout', () => {
+            if (socket !== this.socket) {
+                return
+            }
             this.logger.warn('Socket connection timed out. Ending connection...')
             this.isConnected = false
-            socket.end()
+            socket.destroy()
             this.handleReconnect()
         })
 
@@ -71,30 +98,40 @@ class SocketManager {
      * @private
      */
     handleReconnect() {
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-            this.reconnectAttempts++
-            this.logger.info(
-                `Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`,
-            )
-
-            // Clear any existing timeout before setting a new one
-            if (this.reconnectTimeout) {
-                clearTimeout(this.reconnectTimeout)
-            }
-
-            // Store the timeout handle
-            this.reconnectTimeout = setTimeout(() => {
-                this.createConnection(
-                    () => {},
-                    () => {},
-                    () => {},
-                )
-            }, this.reconnectInterval)
-        } else {
-            this.logger.error(
-                'Max reconnection attempts reached. Please check the connection manually.',
-            )
+        if (this.closedByUser) {
+            return
         }
+
+        // 'error', 'timeout' and 'close' can all follow one failure.
+        // Schedule one attempt only.
+        if (this.reconnectTimeout) {
+            return
+        }
+
+        this.reconnectAttempts++
+        const delay = this.getReconnectDelay()
+        this.logger.info(
+            `Attempting to reconnect in ${delay / 1000} s (attempt ${this.reconnectAttempts})...`,
+        )
+
+        this.reconnectTimeout = setTimeout(() => {
+            this.reconnectTimeout = null
+            if (this.socket && !this.socket.destroyed) {
+                this.socket.destroy()
+            }
+            this.createConnection()
+        }, delay)
+    }
+
+    /**
+     * Returns the delay before the next reconnect attempt.
+     * The delay doubles with each attempt up to maxReconnectInterval.
+     * The bridge never stops its reconnect attempts.
+     * @returns {number} Delay in milliseconds.
+     */
+    getReconnectDelay() {
+        const factor = 2 ** Math.max(0, this.reconnectAttempts - 1)
+        return Math.min(this.reconnectInterval * factor, this.maxReconnectInterval)
     }
 
     /**
@@ -129,9 +166,12 @@ class SocketManager {
      * Closes the socket connection.
      */
     closeConnection() {
+        this.closedByUser = true
+
         // Clear reconnect timeout if it exists
         if (this.reconnectTimeout) {
             clearTimeout(this.reconnectTimeout)
+            this.reconnectTimeout = null
         }
 
         if (this.socket && !this.socket.destroyed) {

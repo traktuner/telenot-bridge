@@ -16,7 +16,9 @@ class MqttHandler {
         this._isConnected = false
         this.reconnectTimer = null
         this.mqttReconnectAttempts = 0
-        this.maxMqttReconnectAttempts = 10
+        this.hasConnectedOnce = false
+        this.clientCreated = false
+        this.reconnectListeners = []
         this.telenot = null
         this.mqttPublisher = null
         this.messageListeners = []
@@ -49,7 +51,17 @@ class MqttHandler {
             return this.connectionPromise
         }
 
-        this.connectionPromise = new Promise((resolve, reject) => {
+        // One client only. The mqtt library reconnects this client by itself
+        // (reconnectPeriod). A second client would publish in parallel and the
+        // publisher would keep the old one.
+        if (this.mqttClient && this.clientCreated) {
+            this.connectionPromise = new Promise((resolve) => {
+                this.mqttClient.once('connect', resolve)
+            })
+            return this.connectionPromise
+        }
+
+        this.connectionPromise = new Promise((resolve) => {
             const { broker, port, clientId, username, password, publishTopic } =
                 config.Connection.mqttConfig
             const url = `${broker}:${port}`
@@ -70,27 +82,35 @@ class MqttHandler {
                     retain: true,
                 },
             })
+            this.clientCreated = true
 
             this.mqttClient.on('connect', () => {
+                const isReconnect = this.hasConnectedOnce
                 this._isConnected = true
+                this.hasConnectedOnce = true
                 this.mqttReconnectAttempts = 0
                 this.reconnectInProgress = false
-                this.logger.info('Connected to MQTT broker')
+                this.connectionPromise = null
+                this.logger.info(
+                    isReconnect ? 'Reconnected to MQTT broker' : 'Connected to MQTT broker',
+                )
                 // Publish online status
                 this.mqttClient.publish(`${publishTopic}/status`, 'online', {
                     retain: true,
                     qos: 1,
                 })
                 resolve()
+
+                if (isReconnect) {
+                    this.notifyReconnect()
+                }
             })
 
             this.mqttClient.on('error', (err) => {
-                this.logger.error('Connection to MQTT broker failed', err)
+                // The mqtt library keeps its reconnect attempts. Do not give up:
+                // states that change during an outage are published after the reconnect.
+                this.logger.error(`Connection to MQTT broker failed: ${err?.message || err}`)
                 this._isConnected = false
-                if (this.mqttReconnectAttempts >= this.maxMqttReconnectAttempts) {
-                    this.logger.error('Max MQTT reconnection attempts reached')
-                    reject(new Error('Max MQTT reconnection attempts reached'))
-                }
             })
 
             this.mqttClient.on('close', () => {
@@ -125,32 +145,37 @@ class MqttHandler {
      * @async
      */
     async handleReconnection() {
-        if (this.reconnectInProgress) {
+        if (this.reconnectInProgress || this._isConnected) {
             return
         }
 
         this.reconnectInProgress = true
-        while (!this._isConnected && this.mqttReconnectAttempts < this.maxMqttReconnectAttempts) {
-            try {
-                this.mqttReconnectAttempts++
-                this.logger.info(
-                    `Attempting to reconnect to MQTT broker (${this.mqttReconnectAttempts}/${this.maxMqttReconnectAttempts})`,
-                )
-                await this.connect()
-                if (this._isConnected) {
-                    break
-                }
-            } catch (error) {
-                this.logger.error(`Reconnection attempt failed: ${error.message}`)
-            }
-            await new Promise((resolve) => setTimeout(resolve, 5000))
-        }
-
-        if (!this._isConnected && this.mqttReconnectAttempts >= this.maxMqttReconnectAttempts) {
-            this.logger.error('Max MQTT reconnection attempts reached')
-        }
-
+        this.logger.warn('MQTT connection lost. The client reconnects automatically.')
+        await this.connect()
         this.reconnectInProgress = false
+    }
+
+    /**
+     * Registers a callback that runs after each reconnect to the broker.
+     * Use it to publish the states again that changed during the outage.
+     * @param {Function} callback - Called without arguments.
+     */
+    onReconnect(callback) {
+        this.reconnectListeners.push(callback)
+    }
+
+    /**
+     * Runs the reconnect callbacks. A failing callback is logged and does not stop the others.
+     * @private
+     */
+    notifyReconnect() {
+        for (const listener of this.reconnectListeners) {
+            Promise.resolve()
+                .then(() => listener())
+                .catch((error) =>
+                    this.logger.error(`MQTT reconnect handler failed: ${error?.message || error}`),
+                )
+        }
     }
 
     /**
@@ -161,7 +186,7 @@ class MqttHandler {
         this.mqttClient.on('reconnect', () => {
             this.mqttReconnectAttempts++
             this.logger.info(
-                `Attempting to reconnect to MQTT broker (${this.mqttReconnectAttempts}/${this.maxMqttReconnectAttempts})`,
+                `Attempting to reconnect to MQTT broker (attempt ${this.mqttReconnectAttempts})`,
             )
         })
     }

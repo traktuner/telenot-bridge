@@ -1,7 +1,7 @@
 services:
     telenot:
         container_name: telenot-bridge
-        image: ghcr.io/carhensi/telenot-bridge:latest
+        image: ghcr.io/traktuner/telenot-bridge:latest
         restart: unless-stopped
         environment:
             - LOGLEVEL=${LOGLEVEL}
@@ -18,6 +18,8 @@ services:
             - USE_JSON_PAYLOAD=${USE_JSON_PAYLOAD}
             - HOMEASSISTANT_AUTODISCOVERY=${HOMEASSISTANT_AUTODISCOVERY}
             - TZ=${TZ}
+            # - AREA_STATE_ADDRESS=${AREA_STATE_ADDRESS}
+            # - COMMANDS_ENABLED=${COMMANDS_ENABLED}
         build:
             context: .
             dockerfile: Dockerfile

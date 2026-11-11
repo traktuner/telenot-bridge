@@ -306,8 +306,122 @@ describe('TelenotService', () => {
 
         it('should handle invalid address', () => {
             const result = telenot.createCommandMessage(0, 1320, 'E1')
-            expect(result).toBe('error')
+            expect(result).toBeNull()
             expect(mockLogger.error).toHaveBeenCalledWith('Invalid parameter(s) for SB area')
+        })
+
+        it('should use the complex 400H command base by default', () => {
+            const sendSpy = jest.spyOn(telenot, 'sendCommand').mockResolvedValue()
+            telenot.disarmArea(1)
+            telenot.intArmArea(1)
+            telenot.extArmArea(1)
+            telenot.resetArmArea(1)
+
+            const frames = sendSpy.mock.calls.map((call) => call[0])
+            expect(frames.map((frame) => frame.slice(18, 22))).toEqual([
+                '0530',
+                '0531',
+                '0532',
+                '0533',
+            ])
+        })
+
+        it('should use the configured area address of another panel', () => {
+            const previous = config.Telenot.AREA_STATE_ADDRESS
+            config.Telenot.AREA_STATE_ADDRESS = 0x500
+            try {
+                const sendSpy = jest.spyOn(telenot, 'sendCommand').mockResolvedValue()
+                telenot.disarmArea(1)
+                telenot.intArmArea(1)
+                telenot.extArmArea(1)
+
+                const frames = sendSpy.mock.calls.map((call) => call[0])
+                expect(frames.map((frame) => frame.slice(18, 22))).toEqual(['0500', '0501', '0502'])
+            } finally {
+                config.Telenot.AREA_STATE_ADDRESS = previous
+            }
+        })
+
+        it('should refuse every command while commands are disabled', async () => {
+            config.Telenot.COMMANDS_ENABLED = false
+            try {
+                telenot.socketManager.sendData = jest.fn().mockResolvedValue()
+                await expect(telenot.extArmArea(1)).rejects.toThrow('Commands are disabled')
+                expect(telenot.socketManager.sendData).not.toHaveBeenCalled()
+            } finally {
+                config.Telenot.COMMANDS_ENABLED = true
+            }
+        })
+
+        describe('switchable positions', () => {
+            const position = { hex: '0xCA', name: 'Room 1', topic: 't/mb3', switch: true }
+
+            it('should map a position of the state block to its panel address', () => {
+                expect(telenot.getPositionAddress({ hex: '0x10' })).toBe(0x0500)
+                expect(telenot.getPositionAddress(position)).toBe(0x05ba)
+                expect(telenot.getPositionAddress({ hex: '0x40' })).toBe(0x0530)
+            })
+
+            it('should build the same form as the recorded arm frame', () => {
+                // Internal arming of area 1 at address 0x0501 with value 62 (see HIPLEX-8400H.md).
+                expect(telenot.createStateCommand(0x0501, '62')).toBe(
+                    '68090968730105020005010262e516',
+                )
+            })
+
+            it('should send value 51 to switch a detector area off and d1 to switch it on', () => {
+                const sendSpy = jest.spyOn(telenot, 'sendCommand').mockResolvedValue()
+
+                telenot.setSwitch(position, true)
+                telenot.setSwitch(position, false)
+
+                expect(sendSpy.mock.calls[0][0]).toMatch(
+                    /^68090968730105020005ba0251[0-9a-f]{2}16$/,
+                )
+                expect(sendSpy.mock.calls[1][0]).toMatch(
+                    /^68090968730105020005ba02d1[0-9a-f]{2}16$/,
+                )
+            })
+
+            it('should refuse an invalid state value', () => {
+                expect(telenot.createStateCommand(0x05ba, 'zz')).toBeNull()
+                expect(telenot.createStateCommand(0x10000, '51')).toBeNull()
+            })
+
+            it('should accept ON and OFF only on the set topic', () => {
+                telenot.commandHandler.run = jest.fn().mockReturnValue(true)
+                telenot.commandHandler.reportResult = jest.fn()
+
+                expect(telenot.handleSwitchMessage(position, 'on')).toBe(true)
+                expect(telenot.commandHandler.run).toHaveBeenCalledWith(
+                    'SWITCH Room 1 ON',
+                    expect.any(Function),
+                )
+
+                expect(telenot.handleSwitchMessage(position, 'toggle')).toBe(false)
+                expect(telenot.commandHandler.reportResult).toHaveBeenCalledWith(
+                    'SWITCH Room 1 TOGGLE',
+                    false,
+                    'payload must be ON or OFF',
+                )
+            })
+
+            it('should not send a switch frame while commands are disabled', async () => {
+                config.Telenot.COMMANDS_ENABLED = false
+                try {
+                    telenot.socketManager.sendData = jest.fn().mockResolvedValue()
+                    await expect(telenot.setSwitch(position, true)).rejects.toThrow(
+                        'Commands are disabled',
+                    )
+                    expect(telenot.socketManager.sendData).not.toHaveBeenCalled()
+                } finally {
+                    config.Telenot.COMMANDS_ENABLED = true
+                }
+            })
+        })
+
+        it('should reject an invalid area instead of sending a broken frame', async () => {
+            await expect(telenot.disarmArea(9)).rejects.toThrow('Invalid command generated')
         })
 
         it('should calculate correct checksum', () => {

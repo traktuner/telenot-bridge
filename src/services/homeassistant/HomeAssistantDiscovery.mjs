@@ -1,4 +1,14 @@
+import config from '../../config/config.mjs'
+
 // Constants
+const ALARM_PANEL_FEATURES = [
+    'arm_home',
+    'arm_away',
+    'arm_night',
+    'arm_vacation',
+    'arm_custom_bypass',
+    'trigger',
+]
 const MQTT_DISCOVERY_PREFIX = 'homeassistant'
 const DEVICE_VENDOR = 'Telenot'
 const REQUIRED_SENSOR_FIELDS = ['name_ha', 'type', 'topic', 'location', 'hex']
@@ -107,6 +117,18 @@ class HomeAssistantDiscovery {
                 // Publish each sensor for this location
                 for (const sensor of locationSensors) {
                     const entityId = this.generateEntityId(sensor)
+
+                    if (sensor.switch) {
+                        try {
+                            await this.publishSwitch(sensor, entityId, device)
+                        } catch (error) {
+                            this.logger.error(
+                                `     ⚠ Failed to publish switch ${sensor.name_ha}: ${error?.message || error}`,
+                            )
+                        }
+                        continue
+                    }
+
                     const discoveryTopic = `${this.discoveryPrefix}/binary_sensor/telenot/${entityId}/config`
 
                     this.logger.info(
@@ -124,11 +146,20 @@ class HomeAssistantDiscovery {
                         value_template: '{{ value_json.state }}',
                         payload_on: 'ON',
                         payload_off: 'OFF',
-                        icon: ICONS[sensor.type.toLowerCase()] || 'mdi:help-circle',
+                        icon: sensor.icon || ICONS[sensor.type.toLowerCase()] || 'mdi:help-circle',
                         json_attributes_topic: sensor.topic,
                         json_attributes_template: '{{ value_json | tojson }}',
                         device,
                         enabled_by_default: true,
+                        ...this.availability(),
+                    }
+
+                    // A position can set its own device class. `null` means no class:
+                    // Home Assistant then shows plain on/off, for example for 'Unscharf'.
+                    if (sensor.device_class === null) {
+                        delete payload.device_class
+                    } else if (sensor.device_class !== undefined) {
+                        payload.device_class = sensor.device_class
                     }
 
                     try {
@@ -155,6 +186,143 @@ class HomeAssistantDiscovery {
         } catch (error) {
             this.logger.error('Discovery process failed:', error)
             throw error
+        }
+    }
+
+    /**
+     * Publishes a position as a Home Assistant switch. The state comes from the
+     * position topic; a command goes to `<position topic>/set` with ON or OFF.
+     * @param {Object} sensor - A position with `switch` set.
+     * @param {string} entityId - The unique ID of the entity.
+     * @param {Object} device - The Home Assistant device block.
+     * @returns {Promise<Object>} The published payload.
+     */
+    async publishSwitch(sensor, entityId, device) {
+        const payload = {
+            name: sensor.name_ha,
+            unique_id: entityId,
+            state_topic: sensor.topic,
+            value_template: '{{ value_json.state }}',
+            state_on: 'ON',
+            state_off: 'OFF',
+            command_topic: `${sensor.topic}/set`,
+            payload_on: 'ON',
+            payload_off: 'OFF',
+            icon: sensor.icon || 'mdi:shield-off-outline',
+            json_attributes_topic: sensor.topic,
+            json_attributes_template: '{{ value_json | tojson }}',
+            device,
+            ...this.availability(),
+        }
+
+        await this.mqttHandler.publish(
+            `${this.discoveryPrefix}/switch/telenot/${entityId}/config`,
+            JSON.stringify(payload),
+            { retain: true },
+        )
+        this.logger.info(`  └─ Published switch: "${sensor.name_ha}"`)
+        return payload
+    }
+
+    /**
+     * Returns the availability settings for a discovery payload.
+     * The bridge publishes 'online' on connect and the broker publishes
+     * 'offline' (last will) when the bridge disappears.
+     * @returns {Object} Empty if no publish topic is configured.
+     */
+    availability() {
+        const publishTopic = config?.Connection?.mqttConfig?.publishTopic
+        if (!publishTopic) {
+            return {}
+        }
+        return {
+            availability_topic: `${publishTopic}/status`,
+            payload_available: 'online',
+            payload_not_available: 'offline',
+        }
+    }
+
+    /**
+     * Publishes the discovery message of the alarm panel entity.
+     * The disarm code is never part of the payload: with a configured code the
+     * entity uses REMOTE_CODE and the bridge checks the code of each command.
+     * @param {Object} panel - `Telenot.ALARM_PANEL` of the configuration.
+     * @returns {Promise<Object>} The published payload.
+     */
+    async publishAlarmPanel(panel = {}) {
+        const { stateTopic, commandTopic } = config.Connection.mqttConfig
+        const features = (panel.features || []).filter((feature) =>
+            ALARM_PANEL_FEATURES.includes(feature),
+        )
+        const payload = {
+            name: panel.name || 'Alarmanlage',
+            unique_id: panel.unique_id || 'telenot_alarmanlage',
+            state_topic: stateTopic,
+            command_topic: commandTopic,
+            payload_disarm: 'DISARM',
+            payload_arm_home: 'ARM_HOME',
+            payload_arm_away: 'ARM_AWAY',
+            payload_arm_night: 'ARM_NIGHT',
+            supported_features: features,
+            code_arm_required: false,
+            code_disarm_required: Boolean(panel.code),
+            code_trigger_required: false,
+            device: this.panelDevice(panel),
+            ...this.availability(),
+        }
+
+        if (panel.code) {
+            payload.code = 'REMOTE_CODE'
+            payload.command_template = '{"action":"{{ action }}","code":"{{ code }}"}'
+        }
+
+        await this.mqttHandler.publish(
+            `${this.discoveryPrefix}/alarm_control_panel/telenot/alarmanlage/config`,
+            JSON.stringify(payload),
+            { retain: true },
+        )
+        this.logger.info(
+            `Published alarm panel discovery (modes: ${features.join(', ') || 'none'})`,
+        )
+        return payload
+    }
+
+    /**
+     * Publishes the discovery message of the button that resets the panel after an alarm.
+     * @param {Object} panel - `Telenot.ALARM_PANEL` of the configuration.
+     * @returns {Promise<Object>} The published payload.
+     */
+    async publishResetButton(panel = {}) {
+        const payload = {
+            name: panel.reset_name || 'Alarm zurücksetzen',
+            unique_id: 'telenot_alarm_reset',
+            command_topic: config.Connection.mqttConfig.commandTopic,
+            payload_press: 'RESET',
+            icon: 'mdi:restore-alert',
+            device: this.panelDevice(panel),
+            ...this.availability(),
+        }
+
+        await this.mqttHandler.publish(
+            `${this.discoveryPrefix}/button/telenot/alarm_reset/config`,
+            JSON.stringify(payload),
+            { retain: true },
+        )
+        this.logger.info('Published reset button discovery')
+        return payload
+    }
+
+    /**
+     * Returns the Home Assistant device of the alarm panel.
+     * @param {Object} panel - `Telenot.ALARM_PANEL` of the configuration.
+     * @returns {Object} The device block.
+     */
+    panelDevice(panel = {}) {
+        return {
+            identifiers: [panel.device_id || 'telenot_bridge'],
+            name: panel.device_name || 'Telenot',
+            manufacturer: this.deviceVendor,
+            model: panel.device_model || 'Telenot Alarm System',
         }
     }
 

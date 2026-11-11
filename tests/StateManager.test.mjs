@@ -241,149 +241,244 @@ describe('StateManager', () => {
 
     describe('publishAlarmState', () => {
         it('should publish the correct alarm state and log info', async () => {
-            jest.spyOn(stateManager, 'determineAlarmState').mockReturnValue('ARMED_HOME')
+            jest.spyOn(stateManager, 'determineAlarmState').mockReturnValue('armed_home')
 
             await stateManager.publishAlarmState()
 
             expect(mockMqttHandler.publish).toHaveBeenCalledWith(
                 config.Connection.mqttConfig.stateTopic,
-                'ARMED_HOME',
+                'armed_home',
                 { retain: true },
             )
             expect(mockLogger.info).toHaveBeenCalledWith(
-                `\x1b[33mPublishing state: ARMED_HOME to ${config.Connection.mqttConfig.stateTopic}\x1b[0m`,
+                `\x1b[33mPublishing state: armed_home to ${config.Connection.mqttConfig.stateTopic}\x1b[0m`,
             )
         })
 
         it('should handle publish failure and log error', async () => {
             const error = new Error('Publish failed')
-            jest.spyOn(stateManager, 'determineAlarmState').mockReturnValue('DISARMED')
+            jest.spyOn(stateManager, 'determineAlarmState').mockReturnValue('disarmed')
             mockMqttHandler.publish.mockRejectedValueOnce(error)
 
             await expect(stateManager.publishAlarmState()).rejects.toThrow(error)
 
             expect(mockLogger.info).toHaveBeenCalledWith(
-                `\x1b[33mPublishing state: DISARMED to ${config.Connection.mqttConfig.stateTopic}\x1b[0m`,
+                `\x1b[33mPublishing state: disarmed to ${config.Connection.mqttConfig.stateTopic}\x1b[0m`,
             )
         })
     })
 
     describe('determineAlarmState', () => {
-        it('should return ARMED_AWAY when extern_scharf is ON', () => {
-            stateManager.lastPublishedStates.set(
-                'telenot/alarm/kg/ema_zentrale/extern_scharf',
-                'ON',
-            )
-            expect(stateManager.determineAlarmState()).toBe('ARMED_AWAY')
+        const PREFIX = 'telenot/alarm/kg/ema_zentrale'
+
+        it('should return armed_away when extern_scharf is ON', () => {
+            stateManager.lastPublishedStates.set(`${PREFIX}/extern_scharf`, 'ON')
+            expect(stateManager.determineAlarmState()).toBe('armed_away')
         })
 
-        it('should return ARMED_HOME when intern_scharf is ON and extern_scharf is not ON', () => {
-            stateManager.lastPublishedStates.set(
-                'telenot/alarm/kg/ema_zentrale/intern_scharf',
-                'ON',
-            )
-            expect(stateManager.determineAlarmState()).toBe('ARMED_HOME')
+        it('should return armed_home when intern_scharf is ON and extern_scharf is not ON', () => {
+            stateManager.lastPublishedStates.set(`${PREFIX}/intern_scharf`, 'ON')
+            expect(stateManager.determineAlarmState()).toBe('armed_home')
         })
 
-        it('should return DISARMED when neither extern_scharf nor intern_scharf is ON', () => {
-            stateManager.lastPublishedStates.set(
-                'telenot/alarm/kg/ema_zentrale/extern_scharf',
-                'OFF',
-            )
-            stateManager.lastPublishedStates.set(
-                'telenot/alarm/kg/ema_zentrale/intern_scharf',
-                'OFF',
-            )
-            expect(stateManager.determineAlarmState()).toBe('DISARMED')
+        it('should return disarmed when neither extern_scharf nor intern_scharf is ON', () => {
+            stateManager.lastPublishedStates.set(`${PREFIX}/extern_scharf`, 'OFF')
+            stateManager.lastPublishedStates.set(`${PREFIX}/intern_scharf`, 'OFF')
+            expect(stateManager.determineAlarmState()).toBe('disarmed')
         })
-    })
 
-    describe('publishPositionStates', () => {
-        it('should publish states for all positions based on byteMap', async () => {
-            const byteMap = new Map([
-                [0, 255], // 11111111
-                [1, 0], // 00000000
-            ])
-            const positions = [
-                {
-                    hex: '00',
-                    topic: 'test/topic/1',
-                    name: 'Test Position 1',
-                    name_ha: 'Test HA 1',
-                    type: 'binary',
-                    location: 'Test Location',
-                    inverted: false,
-                },
-                {
-                    hex: '08',
-                    topic: 'test/topic/2',
-                    name: 'Test Position 2',
-                    name_ha: 'Test HA 2',
-                    type: 'binary',
-                    location: 'Test Location',
-                    inverted: true,
-                },
-            ]
+        it('should return triggered before any armed state', () => {
+            stateManager.lastPublishedStates.set(`${PREFIX}/alarm`, 'ON')
+            stateManager.lastPublishedStates.set(`${PREFIX}/extern_scharf`, 'ON')
+            expect(stateManager.determineAlarmState()).toBe('triggered')
+        })
 
-            await stateManager.publishPositionStates(byteMap, positions)
+        it('should map armed_home through the virtual state handler', () => {
+            stateManager.virtualStateHandler = { mapToExternalState: () => 'armed_night' }
+            stateManager.lastPublishedStates.set(`${PREFIX}/intern_scharf`, 'ON')
+            expect(stateManager.determineAlarmState()).toBe('armed_night')
+        })
 
-            expect(mockMqttHandler.publish).toHaveBeenCalledTimes(2)
+        describe('with another topic prefix and no roles', () => {
+            beforeEach(() => {
+                stateManager.config = {
+                    ...config,
+                    Telenot: {
+                        MELDEBEREICHE: {
+                            positions: [
+                                { hex: '0x11', name: 'Intern', topic: 'my/panel/intern_scharf' },
+                                { hex: '0x12', name: 'Extern', topic: 'my/panel/extern_scharf' },
+                                { hex: '0x13', name: 'Alarm', topic: 'my/panel/alarm' },
+                            ],
+                        },
+                    },
+                }
+            })
+
+            it('should find the legacy topics by their ending', () => {
+                stateManager.lastPublishedStates.set('my/panel/extern_scharf', 'ON')
+                expect(stateManager.determineAlarmState()).toBe('armed_away')
+            })
+
+            it('should not treat a topic as triggered without a role', () => {
+                stateManager.lastPublishedStates.set('my/panel/alarm', 'ON')
+                expect(stateManager.determineAlarmState()).toBe('disarmed')
+            })
         })
     })
 
-    describe('processStateChanges', () => {
-        it('should publish state changes based on bit differences', async () => {
-            const newValue = 1 // 00000001
-            const oldValue = 0 // 00000000
-            const byteIndex = 0
-            const positions = [
-                {
-                    hex: '00',
-                    topic: 'test/topic/1',
-                    name: 'Test Position 1',
-                    name_ha: 'Test HA 1',
-                    type: 'binary',
-                    location: 'Test Location',
-                    inverted: false,
-                },
-            ]
+    describe('alarm state follows the state bits', () => {
+        const positions = [
+            { hex: '0x10', name: 'Unscharf', topic: 't/unscharf', inverted: true },
+            { hex: '0x11', name: 'Intern', topic: 't/intern', inverted: true, role: 'armed_home' },
+            { hex: '0x12', name: 'Extern', topic: 't/extern', inverted: true, role: 'armed_away' },
+        ]
+        const contentConfig = { name: 'MELDEBEREICHE', offset: 10, positions }
+        const stateTopic = config.Connection.mqttConfig.stateTopic
+        const statePublishes = () =>
+            mockMqttHandler.publish.mock.calls.filter((call) => call[0] === stateTopic)
 
-            await stateManager.processStateChanges(newValue, oldValue, byteIndex, positions)
-
-            expect(mockMqttHandler.publish).toHaveBeenCalledTimes(1)
-            expect(mockLogger.info).toHaveBeenCalledWith(
-                expect.stringContaining('Published state change:'),
-            )
+        beforeEach(() => {
+            stateManager.config = {
+                ...config,
+                Discover: true,
+                Telenot: { MELDEBEREICHE: contentConfig },
+            }
         })
 
-        it('should handle inverted positions correctly', async () => {
-            const newValue = 0 // 00000000
-            const oldValue = 1 // 00000001
-            const byteIndex = 0
-            const positions = [
-                {
-                    hex: '00',
-                    topic: 'test/topic/1',
-                    name: 'Test Position 1',
-                    name_ha: 'Test HA 1',
-                    type: 'binary',
-                    location: 'Test Location',
-                    inverted: true,
-                },
-            ]
+        it('should publish armed_home and then disarmed when the bits change', async () => {
+            // Byte 2 holds 0x10..0x17. Inverted: bit 0 = active. Disarmed: bit0=0, bit1=1, bit2=1.
+            const disarmed = new Map([[2, 0b11111110]])
+            const armedHome = new Map([[2, 0b11111101]])
 
-            await stateManager.processStateChanges(newValue, oldValue, byteIndex, positions)
+            await stateManager.handleStateChange(disarmed, 'MELDEBEREICHE', contentConfig)
+            expect(statePublishes().at(-1)[1]).toBe('disarmed')
 
-            expect(mockMqttHandler.publish).toHaveBeenCalledWith(
-                'test/topic/1',
-                expect.stringMatching(
-                    /^\{"id":"test_position_1_00","name":"Test HA 1","type":"binary","state":"ON","location":"Test Location","last_triggered":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z"\}$/,
+            await stateManager.handleStateChange(armedHome, 'MELDEBEREICHE', contentConfig)
+            expect(statePublishes().at(-1)[1]).toBe('armed_home')
+
+            await stateManager.handleStateChange(disarmed, 'MELDEBEREICHE', contentConfig)
+            expect(statePublishes().at(-1)[1]).toBe('disarmed')
+        })
+
+        it('should not publish the alarm state again when it did not change', async () => {
+            await stateManager.handleStateChange(
+                new Map([[2, 0b11111110]]),
+                'MELDEBEREICHE',
+                contentConfig,
+            )
+            const count = statePublishes().length
+
+            // Only 'Unscharf' changes its bit; the derived state stays 'disarmed'.
+            await stateManager.handleStateChange(
+                new Map([[2, 0b11111111]]),
+                'MELDEBEREICHE',
+                contentConfig,
+            )
+            expect(statePublishes()).toHaveLength(count)
+        })
+
+        it('should log every changed bit in discovery mode, also unconfigured ones', async () => {
+            await stateManager.handleStateChange(
+                new Map([[25, 0xff]]),
+                'MELDEBEREICHE',
+                contentConfig,
+            )
+            await stateManager.handleStateChange(
+                new Map([[25, 0xfb]]),
+                'MELDEBEREICHE',
+                contentConfig,
+            )
+
+            const lines = mockLogger.info.mock.calls.map((call) => call[0])
+            expect(
+                lines.some((line) =>
+                    /^DISCOVERY: .*\| MELDEBEREICHE \| 0x0CA \(dec:202\) \| Byte:25 Bit:2 \| 1->0 \| UNKNOWN$/.test(
+                        line,
+                    ),
                 ),
-                { retain: true },
-            )
-            expect(mockLogger.info).toHaveBeenCalledWith(
-                expect.stringContaining('Published state change:'),
-            )
+            ).toBe(true)
         })
+    })
+})
+
+describe('StateManager.republishAll', () => {
+    it('should publish states again that failed during a broker outage', async () => {
+        const logger = { info: jest.fn(), error: jest.fn(), warn: jest.fn(), debug: jest.fn() }
+        const mqttHandler = { publish: jest.fn() }
+        const stateManager = new StateManager(logger, mqttHandler)
+        const positions = [
+            { hex: '0x11', name: 'Intern', topic: 't/intern', inverted: true, role: 'armed_home' },
+        ]
+        const contentConfig = { name: 'MELDEBEREICHE', offset: 10, positions }
+        stateManager.config = {
+            ...config,
+            Discover: false,
+            Telenot: { MELDEBEREICHE: contentConfig },
+        }
+        const stateTopic = config.Connection.mqttConfig.stateTopic
+
+        mqttHandler.publish.mockResolvedValue()
+        await stateManager.handleStateChange(new Map([[2, 0xff]]), 'MELDEBEREICHE', contentConfig)
+
+        // The panel is armed while the broker is unreachable: the publish fails.
+        mqttHandler.publish.mockRejectedValue(new Error('Not connected to MQTT broker'))
+        await stateManager.handleStateChange(new Map([[2, 0xfd]]), 'MELDEBEREICHE', contentConfig)
+        expect(stateManager.lastPublishedStates.get('t/intern')).toBe('OFF')
+
+        // The broker is back.
+        mqttHandler.publish.mockReset()
+        mqttHandler.publish.mockResolvedValue()
+        await stateManager.republishAll()
+
+        const published = Object.fromEntries(
+            mqttHandler.publish.mock.calls.map((call) => [call[0], call[1]]),
+        )
+        expect(JSON.parse(published['t/intern']).state).toBe('ON')
+        expect(published[stateTopic]).toBe('armed_home')
+    })
+
+    it('should publish unchanged states again too, for a broker that lost its retained messages', async () => {
+        const logger = { info: jest.fn(), error: jest.fn(), warn: jest.fn(), debug: jest.fn() }
+        const mqttHandler = { publish: jest.fn().mockResolvedValue() }
+        const stateManager = new StateManager(logger, mqttHandler)
+        const positions = [{ hex: '0x10', name: 'Unscharf', topic: 't/unscharf', inverted: true }]
+        const contentConfig = { name: 'MELDEBEREICHE', offset: 10, positions }
+        stateManager.config = {
+            ...config,
+            Discover: false,
+            Telenot: { MELDEBEREICHE: contentConfig },
+        }
+
+        await stateManager.handleStateChange(new Map([[2, 0xfe]]), 'MELDEBEREICHE', contentConfig)
+        mqttHandler.publish.mockClear()
+
+        await stateManager.republishAll()
+
+        const topics = mqttHandler.publish.mock.calls.map((call) => call[0])
+        expect(topics).toContain('t/unscharf')
+        expect(topics).toContain(config.Connection.mqttConfig.stateTopic)
+    })
+})
+
+describe('StateManager arming state', () => {
+    it('should publish arming while an arm command waits, and the real state afterwards', async () => {
+        const logger = { info: jest.fn(), error: jest.fn(), warn: jest.fn(), debug: jest.fn() }
+        const mqttHandler = { publish: jest.fn().mockResolvedValue() }
+        const stateManager = new StateManager(logger, mqttHandler)
+        const stateTopic = config.Connection.mqttConfig.stateTopic
+        const last = () =>
+            mqttHandler.publish.mock.calls.filter((call) => call[0] === stateTopic).at(-1)[1]
+
+        await stateManager.setPendingArm(true)
+        expect(last()).toBe('arming')
+
+        // An armed or triggered panel state has priority over 'arming'.
+        stateManager.lastPublishedStates.set('telenot/alarm/kg/ema_zentrale/intern_scharf', 'ON')
+        expect(stateManager.determineAlarmState()).toBe('armed_home')
+        stateManager.lastPublishedStates.clear()
+
+        await stateManager.setPendingArm(false)
+        expect(last()).toBe('disarmed')
     })
 })

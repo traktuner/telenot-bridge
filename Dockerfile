@@ -1,10 +1,13 @@
 # Stage 1: Build Stage
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 
 RUN apk update && apk add --no-cache dumb-init
 
 # Set working directory
 WORKDIR /app
+
+# Node.js images from version 25 do not contain Yarn. The lockfile is a Yarn 1 file.
+RUN npm install --global --no-fund --no-audit yarn@1.22.22
 
 # Install dependencies
 COPY package.json yarn.lock ./
@@ -15,7 +18,7 @@ RUN yarn install --frozen-lockfile --production && \
 COPY . .
 
 # Stage 2: Production Stage
-FROM node:22-alpine
+FROM node:26-alpine
 
 # Set working directory
 WORKDIR /app
@@ -35,6 +38,10 @@ USER appuser
 
 # Define environment variables (can be overridden at runtime)
 ENV NODE_ENV=production
+
+# Healthy only while the alarm panel sends data (see src/healthcheck.mjs)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["node", "src/healthcheck.mjs"]
 
 # Start the application
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]

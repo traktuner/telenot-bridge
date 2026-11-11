@@ -88,6 +88,9 @@ describe('HomeAssistantDiscovery', () => {
                 value_template: '{{ value_json.state }}',
                 payload_on: 'ON',
                 payload_off: 'OFF',
+                availability_topic: 'telenot/alarm/status',
+                payload_available: 'online',
+                payload_not_available: 'offline',
                 icon: 'mdi:motion-sensor',
                 json_attributes_topic: 'home/sensor1',
                 json_attributes_template: '{{ value_json | tojson }}',
@@ -121,6 +124,9 @@ describe('HomeAssistantDiscovery', () => {
                 value_template: '{{ value_json.state }}',
                 payload_on: 'ON',
                 payload_off: 'OFF',
+                availability_topic: 'telenot/alarm/status',
+                payload_available: 'online',
+                payload_not_available: 'offline',
                 icon: 'mdi:smoke-detector',
                 json_attributes_topic: 'home/sensor2',
                 json_attributes_template: '{{ value_json | tojson }}',
@@ -320,5 +326,100 @@ describe('HomeAssistantDiscovery', () => {
             const entityId = discovery.generateEntityId(sensor)
             expect(entityId).toBe('floor_1_rauchmelder_smoke_detector_2')
         })
+    })
+})
+
+describe('HomeAssistantDiscovery alarm panel', () => {
+    const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }
+    let mqttHandler, discovery
+
+    beforeEach(() => {
+        mqttHandler = {
+            isConnected: jest.fn().mockReturnValue(true),
+            publish: jest.fn().mockResolvedValue(),
+        }
+        discovery = new HomeAssistantDiscovery(logger, mqttHandler)
+    })
+
+    const published = () => {
+        const [topic, payload, options] = mqttHandler.publish.mock.calls.at(-1)
+        return { topic, payload: JSON.parse(payload), options, raw: payload }
+    }
+
+    it('should publish the panel with the configured modes only and keep the entity identity', async () => {
+        await discovery.publishAlarmPanel({ features: ['arm_home', 'unknown_mode'] })
+
+        const { topic, payload, options } = published()
+        expect(topic).toBe('homeassistant/alarm_control_panel/telenot/alarmanlage/config')
+        expect(options).toEqual({ retain: true })
+        expect(payload.unique_id).toBe('telenot_alarmanlage')
+        expect(payload.supported_features).toEqual(['arm_home'])
+        expect(payload.state_topic).toBe('telenot/alarm/state')
+        expect(payload.command_topic).toBe('telenot/alarm/command')
+        expect(payload.availability_topic).toBe('telenot/alarm/status')
+        expect(payload.code_disarm_required).toBe(false)
+        expect(payload.code).toBeUndefined()
+    })
+
+    it('should never publish the code; the bridge checks it', async () => {
+        await discovery.publishAlarmPanel({ features: ['arm_home'], code: '4711' })
+
+        const { payload, raw } = published()
+        expect(raw).not.toContain('4711')
+        expect(payload.code).toBe('REMOTE_CODE')
+        expect(payload.code_disarm_required).toBe(true)
+        expect(payload.code_arm_required).toBe(false)
+        expect(payload.command_template).toBe('{"action":"{{ action }}","code":"{{ code }}"}')
+    })
+
+    it('should publish a reset button that sends RESET to the command topic', async () => {
+        await discovery.publishResetButton({ device_name: 'Panel' })
+
+        const { topic, payload } = published()
+        expect(topic).toBe('homeassistant/button/telenot/alarm_reset/config')
+        expect(payload.payload_press).toBe('RESET')
+        expect(payload.command_topic).toBe('telenot/alarm/command')
+        expect(payload.device.name).toBe('Panel')
+    })
+
+    it('should publish a switchable position as a switch with a set topic', async () => {
+        await discovery.publishDiscoveryMessages([
+            {
+                name_ha: 'Fenster überbrückt',
+                type: 'abschaltung',
+                topic: 'telenot/alarm/eg/mb_room1',
+                location: 'Room 1',
+                hex: '0xCA',
+                switch: true,
+            },
+        ])
+
+        const { topic, payload } = published()
+        expect(topic).toMatch(/^homeassistant\/switch\/telenot\/room_1_abschaltung_/)
+        expect(payload.state_topic).toBe('telenot/alarm/eg/mb_room1')
+        expect(payload.command_topic).toBe('telenot/alarm/eg/mb_room1/set')
+        expect(payload.payload_on).toBe('ON')
+        expect(payload.state_on).toBe('ON')
+        expect(mqttHandler.publish).toHaveBeenCalledTimes(1)
+    })
+
+    it('should let a position set or remove its device class', async () => {
+        const base = { type: 'systemstatus', topic: 't/x', location: 'Zentrale', hex: '0x10' }
+        await discovery.publishDiscoveryMessages([
+            { ...base, name_ha: 'Default' },
+            { ...base, name_ha: 'None', device_class: null },
+            { ...base, name_ha: 'Own', device_class: 'running', icon: 'mdi:shield' },
+        ])
+
+        const byName = Object.fromEntries(
+            mqttHandler.publish.mock.calls.map((call) => {
+                const payload = JSON.parse(call[1])
+                return [payload.name, payload]
+            }),
+        )
+        expect(byName.Default.device_class).toBe('problem')
+        expect('device_class' in byName.None).toBe(false)
+        expect(byName.Own.device_class).toBe('running')
+        expect(byName.Own.icon).toBe('mdi:shield')
     })
 })

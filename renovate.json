@@ -1,0 +1,34 @@
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "extends": [
+        "config:recommended",
+        "helpers:pinGitHubActionDigests",
+        ":dependencyDashboard",
+        ":rebaseStalePrs"
+    ],
+    "timezone": "Europe/Vienna",
+    "platformAutomerge": false,
+    "internalChecksFilter": "strict",
+    "packageRules": [
+        {
+            "description": "Merge minor, patch, pin and digest updates by themselves after 14 days and a green CI. Major updates always need a manual review.",
+            "matchUpdateTypes": [
+                "minor",
+                "patch",
+                "pin",
+                "pinDigest",
+                "digest"
+            ],
+            "minimumReleaseAge": "14 days",
+            "automerge": true,
+            "automergeType": "pr"
+        },
+        {
+            "description": "The Docker base image stays on the moving tag (node:<major>-alpine). The monthly rebuild pulls the newest base image and a new patch tag.",
+            "matchManagers": [
+                "dockerfile"
+            ],
+            "pinDigests": false
+        }
+    ]
+}

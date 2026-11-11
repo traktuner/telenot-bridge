@@ -112,15 +112,49 @@ describe('MqttHandler', () => {
             )
         })
 
-        it('should handle connection errors when max reconnection attempts reached', async () => {
-            mqttHandler.mqttReconnectAttempts = mqttHandler.maxMqttReconnectAttempts
+        it('should keep waiting for the connection after an error', async () => {
             const connectPromise = mqttHandler.connect()
-            const error = new Error('Connection failed')
+            let settled = false
+            connectPromise.then(() => (settled = true))
 
-            mockClient.emit('error', error)
+            mockClient.emit('error', new Error('Connection failed'))
+            await Promise.resolve()
+            expect(settled).toBe(false)
+            expect(mockLogger.error).toHaveBeenCalledWith(
+                'Connection to MQTT broker failed: Connection failed',
+            )
 
-            await expect(connectPromise).rejects.toThrow('Max MQTT reconnection attempts reached')
-            expect(mockLogger.error).toHaveBeenCalledWith('Max MQTT reconnection attempts reached')
+            mockClient.emit('connect')
+            await connectPromise
+            expect(mqttHandler._isConnected).toBe(true)
+        })
+
+        it('should create one client only and call the reconnect listeners after a reconnect', async () => {
+            const mqttModule = (await import('mqtt')).default
+            mqttModule.connect.mockClear()
+            const onReconnect = jest.fn()
+            const failing = jest.fn(() => {
+                throw new Error('republish failed')
+            })
+            mqttHandler.onReconnect(failing)
+            mqttHandler.onReconnect(onReconnect)
+
+            const first = mqttHandler.connect()
+            mockClient.emit('connect')
+            await first
+            expect(onReconnect).not.toHaveBeenCalled()
+
+            mockClient.emit('close')
+            expect(mqttHandler._isConnected).toBe(false)
+            mockClient.emit('connect')
+            await flushPromises()
+
+            expect(mqttModule.connect).toHaveBeenCalledTimes(1)
+            expect(mqttHandler._isConnected).toBe(true)
+            expect(onReconnect).toHaveBeenCalledTimes(1)
+            expect(mockLogger.error).toHaveBeenCalledWith(
+                'MQTT reconnect handler failed: republish failed',
+            )
         })
 
         it('should return existing connectionPromise if connection is in progress', async () => {
@@ -149,77 +183,27 @@ describe('MqttHandler', () => {
     })
 
     describe('handleReconnection', () => {
-        beforeEach(() => {
-            jest.useFakeTimers()
-        })
-
-        afterEach(() => {
-            jest.useRealTimers()
-        })
-
-        it('should attempt reconnection until max attempts reached', async () => {
-            mqttHandler.reconnectInProgress = false
+        it('should wait for the automatic reconnect of the existing client', async () => {
             mqttHandler._isConnected = false
-            mqttHandler.mqttReconnectAttempts = 0
-            mqttHandler.maxMqttReconnectAttempts = 3
+            const connectSpy = jest.spyOn(mqttHandler, 'connect').mockResolvedValue()
 
-            const connectSpy = jest.spyOn(mqttHandler, 'connect').mockImplementation(() => {
-                return Promise.reject(new Error('Connection failed'))
-            })
+            await mqttHandler.handleReconnection()
 
-            const handleReconnectionPromise = mqttHandler.handleReconnection()
-
-            // First attempt
-            await advanceTime(0)
-            await advanceTime(5000)
-
-            // Second attempt
-            await advanceTime(0)
-            await advanceTime(5000)
-
-            // Third attempt
-            await advanceTime(0)
-            await advanceTime(5000)
-
-            await handleReconnectionPromise
-
-            expect(connectSpy).toHaveBeenCalledTimes(3)
-            expect(mqttHandler.mqttReconnectAttempts).toBe(3)
-            expect(mqttHandler.reconnectInProgress).toBe(false)
-            expect(mockLogger.error).toHaveBeenCalledWith('Max MQTT reconnection attempts reached')
-        })
-
-        it('should stop reconnection when connection is established', async () => {
-            mqttHandler.reconnectInProgress = false
-            mqttHandler._isConnected = false
-            mqttHandler.mqttReconnectAttempts = 0
-
-            const connectSpy = jest.spyOn(mqttHandler, 'connect').mockImplementation(() => {
-                mqttHandler._isConnected = true
-                return Promise.resolve()
-            })
-
-            const reconnectionPromise = mqttHandler.handleReconnection()
-            jest.runAllTimers()
-            await reconnectionPromise
-
-            expect(mqttHandler.reconnectInProgress).toBe(false)
-            expect(mqttHandler.mqttReconnectAttempts).toBe(1)
             expect(connectSpy).toHaveBeenCalledTimes(1)
+            expect(mqttHandler.reconnectInProgress).toBe(false)
+            expect(mockLogger.warn).toHaveBeenCalledWith(
+                'MQTT connection lost. The client reconnects automatically.',
+            )
         })
 
         it('should return immediately if already connected', async () => {
-            mqttHandler.reconnectInProgress = false
             mqttHandler._isConnected = true
-
             const connectSpy = jest.spyOn(mqttHandler, 'connect').mockResolvedValue()
-            const reconnectionPromise = mqttHandler.handleReconnection()
-            jest.runAllTimers()
-            await reconnectionPromise
+
+            await mqttHandler.handleReconnection()
 
             expect(connectSpy).not.toHaveBeenCalled()
             expect(mqttHandler.reconnectInProgress).toBe(false)
-            expect(mqttHandler.mqttReconnectAttempts).toBe(0)
         })
     })
 
@@ -447,18 +431,19 @@ describe('MqttHandler', () => {
             expect(mockLogger.info).toHaveBeenCalledWith('MQTT connection closed')
         })
 
-        it('should attempt reconnection after connection loss', async () => {
+        it('should report the connection loss and wait for the automatic reconnect', async () => {
             mockClient.emit('close')
-            jest.runOnlyPendingTimers()
-            expect(mockLogger.info).toHaveBeenCalledWith(
-                expect.stringContaining('Attempting to reconnect'),
+            expect(mockLogger.warn).toHaveBeenCalledWith(
+                'MQTT connection lost. The client reconnects automatically.',
             )
         })
 
         it('should handle error events', () => {
             const error = new Error('Test error')
             mockClient.emit('error', error)
-            expect(mockLogger.error).toHaveBeenCalledWith('Connection to MQTT broker failed', error)
+            expect(mockLogger.error).toHaveBeenCalledWith(
+                'Connection to MQTT broker failed: Test error',
+            )
         })
     })
 
@@ -557,7 +542,7 @@ describe('MqttHandler', () => {
 
             expect(mqttHandler.mqttReconnectAttempts).toBe(2)
             expect(mockLogger.info).toHaveBeenCalledWith(
-                `Attempting to reconnect to MQTT broker (2/${mqttHandler.maxMqttReconnectAttempts})`,
+                'Attempting to reconnect to MQTT broker (attempt 2)',
             )
         })
     })
@@ -566,4 +551,11 @@ describe('MqttHandler', () => {
 async function advanceTime(ms) {
     jest.advanceTimersByTime(ms)
     await Promise.resolve()
+}
+
+// Fake timers are active: wait for pending promise callbacks without a timer.
+async function flushPromises() {
+    for (let i = 0; i < 10; i++) {
+        await Promise.resolve()
+    }
 }

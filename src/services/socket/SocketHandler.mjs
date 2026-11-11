@@ -1,4 +1,5 @@
 import config from '../../config/config.mjs'
+import { getAreaStateAddress, toFrameHex } from '../../utils/AreaAddress.mjs'
 
 // Confirmation ACK
 const CONF_ACK = Buffer.from('6802026800020216', 'hex')
@@ -110,13 +111,18 @@ class SocketHandler {
         }
 
         // System state messages
-        if (/^682[c|C]2[c|C]68730205020005310162/.test(hexStr)) {
+        // The event frames carry the state address of area 1 (complex 400H: 0530/0531/0532).
+        const areaState = getAreaStateAddress(config)
+        const stateEvent = (offset, value) =>
+            new RegExp(`^682c2c687302050200${toFrameHex(areaState + offset)}${value}`, 'i')
+
+        if (stateEvent(1, '0162').test(hexStr)) {
             return TelenotMsgType.SYS_INT_ARMED
         }
-        if (/^682[c|C]2[c|C]68730205020005320161/.test(hexStr)) {
+        if (stateEvent(2, '0161').test(hexStr)) {
             return TelenotMsgType.SYS_EXT_ARMED
         }
-        if (/^682[c|C]2[c|C]687302050200053001[e|E]1/.test(hexStr)) {
+        if (stateEvent(0, '01e1').test(hexStr)) {
             return TelenotMsgType.SYS_DISARMED
         }
 
